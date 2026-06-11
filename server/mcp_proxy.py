@@ -51,10 +51,13 @@ AGENTGATE_URL = os.getenv("AGENTGATE_URL", "http://localhost:8000").rstrip("/")
 AGENTGATE_API_KEY = os.getenv("AGENTGATE_API_KEY", "")
 MCP_UPSTREAM_URL = os.getenv("MCP_UPSTREAM_URL", "").rstrip("/")
 
-app = FastAPI(title="AgentGate MCP Proxy", version="1.1.0")
+app = FastAPI(title="AgentGate MCP Proxy", version="1.2.0")
 
 # Methods that require AgentGate authorization before forwarding
 _INTERCEPTED = {"tools/call", "resources/read"}
+
+# Methods where the proxy scans the RESPONSE (forwarded first, scanned before returning)
+_RESPONSE_SCANNED = {"tools/list"}
 
 # Threat categories that indicate active tool poisoning — hard block.
 # A file-reader or search tool has no legitimate reason to include LLM
@@ -267,6 +270,47 @@ async def mcp_proxy(request: Request):
     method = body.get("method", "")
     req_id = body.get("id")
 
+    # tools/list: forward first, then scan the response for descriptor
+    # poisoning and rug-pull mutations before returning to the agent.
+    if method in _RESPONSE_SCANNED:
+        upstream = await _forward(body, {})
+        rpc_result = upstream.get("result")
+        if isinstance(rpc_result, dict):
+            try:
+                from core.mcp_descriptor_guard import scan_tool_descriptions
+                safe_result, reason, categories = scan_tool_descriptions(
+                    rpc_result, MCP_UPSTREAM_URL
+                )
+                if safe_result is None:
+                    print(
+                        f"[AgentGate MCP] DESCRIPTOR_THREAT BLOCKED — "
+                        f"upstream={MCP_UPSTREAM_URL} categories={categories}",
+                        flush=True,
+                    )
+                    import asyncio
+                    asyncio.create_task(
+                        _report_to_agentgate(
+                            agent_id or "unknown", token or "", method,
+                            reason, True, categories,
+                        )
+                    )
+                    return JSONResponse(
+                        _jsonrpc_error(req_id, -32009, f"DESCRIPTOR_THREAT_BLOCKED: {reason}")
+                    )
+            except Exception as exc:
+                # Guard failure must never silently pass poisoned descriptions —
+                # fail closed: block the response so the agent cannot proceed with
+                # unverified tool descriptions.
+                print(
+                    f"[AgentGate MCP] descriptor guard error (fail-closed): {exc}",
+                    flush=True,
+                )
+                return JSONResponse(
+                    _jsonrpc_error(req_id, -32000,
+                                   f"Descriptor guard error — tools/list blocked: {exc}")
+                )
+        return JSONResponse(upstream)
+
     # Pass through non-intercepted methods immediately
     if method not in _INTERCEPTED:
         result = await _forward(body, {})
@@ -344,6 +388,7 @@ async def healthz():
         "agentgate_url": AGENTGATE_URL,
         "upstream_configured": bool(MCP_UPSTREAM_URL),
         "tool_poisoning_scan": "enabled",
+        "descriptor_guard": "enabled",
     }
 
 
