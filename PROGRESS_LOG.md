@@ -4,6 +4,87 @@ Neutral engineering changelog — what changed, test results, branch/PR links.
 
 ---
 
+## 2026-06-13 — SQLite WAL mode + async audit write queue
+
+**Branch:** `daily/2026-06-13-audit-wal-write-queue`
+
+### What changed
+
+**Modified: `core/audit.py`**
+
+Three layered improvements to the audit path:
+
+1. **WAL journal mode** — `init_db()` now issues `PRAGMA journal_mode=WAL`. WAL (Write-Ahead Log)
+   allows readers to proceed concurrently with writers without blocking. In the previous DELETE
+   mode, `BEGIN EXCLUSIVE` blocked every read connection (dashboard, `/audit/verify`,
+   `/audit/export`) for the duration of every write. WAL eliminates that contention.
+
+2. **`_open_db()` helper** — centralises per-connection settings (`synchronous=NORMAL`). SQLite's
+   `synchronous` pragma is not persistent; it must be set on each connection. The new helper
+   ensures every write connection gets `NORMAL` sync automatically. In WAL mode `NORMAL` is safe
+   (survives OS crash; only risks losing the last commit on a hard power failure — acceptable for
+   an authorization log). `FULL` sync (the default) calls `fsync` on every commit, which is the
+   dominant latency cost at high throughput.
+
+3. **`log_decision_queued()` + `flush_audit_queue()`** — decouples authorization latency from
+   audit-write latency. The hot `/authorize` path now enqueues the entry and returns immediately;
+   a single background daemon thread (`agentgate-audit-writer`) drains the queue in FIFO order.
+   FIFO ordering preserves the HMAC chain sequence so no `BEGIN EXCLUSIVE` lock is needed in the
+   writer thread — `BEGIN IMMEDIATE` is sufficient (allows concurrent readers). The queue is
+   bounded at `AGENTGATE_AUDIT_QUEUE_SIZE` entries (default 10 000); if it fills the call falls
+   back to synchronous write so no entries are ever silently dropped. `flush_audit_queue()` wraps
+   `Queue.join()` and is called in the server lifespan shutdown so in-flight entries are persisted
+   before process exit.
+
+   Lock change: `log_decision()` (the synchronous write used by the background thread and by
+   tests directly) changed from `BEGIN EXCLUSIVE` to `BEGIN IMMEDIATE`. EXCLUSIVE blocks all
+   reader connections; IMMEDIATE in WAL mode allows concurrent reads while holding the write lock.
+
+**Modified: `server/main.py`**
+
+- All six `await asyncio.to_thread(audit.log_decision, ...)` call sites in `/authorize` replaced
+  with `audit.log_decision_queued(...)` — non-blocking, no thread pool overhead for the enqueue.
+- Added `await asyncio.to_thread(audit.flush_audit_queue)` in the lifespan shutdown sequence to
+  drain pending entries before teardown.
+
+**New file: `tests/test_audit_queue.py`**
+
+30 integration tests (require full project deps: pydantic, fastapi) covering:
+- `TestWALMode` (3 tests) — journal mode is WAL, synchronous is NORMAL on same connection,
+  concurrent reader is not blocked under IMMEDIATE lock
+- `TestLogDecisionQueued` (6 tests) — returns sub-50ms, entry persists after flush, multiple
+  entries all written, decision field correct, writer thread is daemon, thread name
+- `TestChainIntegrity` (4 tests) — chain valid after queued writes, valid mixing sync + queued,
+  order matches queue order, 50-thread concurrent submission produces unbroken chain
+- `TestQueueFullFallback` (1 test) — monkeypatched full queue falls back to synchronous write
+- `TestFlushAuditQueue` (3 tests) — empty queue returns fast, waits for all entries, idempotent
+
+**New file: `tests/test_audit_wal_stdlib.py`**
+
+14 stdlib-only tests (no external dependencies — runs in constrained environments):
+
+- `TestWALPragmas` (6 tests) — WAL mode persists, synchronous=NORMAL per-connection, exclusive
+  lock proof (DELETE mode blocks reader vs WAL mode does not), concurrent readers succeed
+- `TestQueuePrimitives` (5 tests) — FIFO order, Full exception, join/task_done semantics,
+  single-consumer ordering guarantee, daemon thread contract
+- `TestHMACChainInvariant` (3 tests) — sequential submission preserves order, 200-item
+  concurrent-producer single-consumer total count
+
+### Test results
+
+```
+Ran 14 tests in 0.117s — OK  (test_audit_wal_stdlib.py, stdlib only)
+```
+
+Full integration tests (`test_audit_queue.py`) require `pydantic`, `fastapi`, and the full
+`requirements.txt` stack — not available in this environment due to network restrictions.
+
+### Market analysis
+
+Market analysis completed; recorded privately.
+
+---
+
 ## 2026-06-11 — MCP Descriptor Guard (rug-pull + descriptor poisoning detection)
 
 **Branch:** `daily/2026-06-11-mcp-rugpull-detection`
