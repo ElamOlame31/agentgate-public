@@ -141,6 +141,7 @@ Trust is scored across 4 dimensions:
 | Agent calls `delete` (not in authorized actions) | `DENY — UNAUTHORIZED_ACTION` |
 | Child agent claims more scope than parent granted | `DENY — CHAIN_SCOPE_VIOLATION` |
 | Agent fires 80 requests/min (data exfiltration pattern) | `DENY — CRITICAL_VELOCITY` |
+| Agent that has only read/searched for hours suddenly attempts `delete` | `ESCALATE — ACTION_TYPE_ESCALATION` |
 | Document says "ignore your previous instructions" | Blocked before agent reads it |
 | Prompt injection in tool output or external content | Hybrid keyword + semantic scan |
 | Unknown agent attempts access | `DENY — UNREGISTERED_AGENT` |

@@ -11,6 +11,8 @@ Flags are tiered:
   KILL_CHAIN:READ_THEN_DELETE               hard DENY — read a resource, then delete it (5-min)
   KILL_CHAIN:SENSITIVITY_RAMP              ESCALATE  — progressive sensitivity increase (5-min)
   KILL_CHAIN:DIRECTORY_SWEEP               ESCALATE  — broad cross-directory recon (5-min)
+  KILL_CHAIN:ACTION_TYPE_ESCALATION        ESCALATE  — first destructive/exfil action after
+                                                        sustained benign history (24h)
   KILL_CHAIN:CROSS_SESSION:BULK_READ_*     hard DENY — slow APT-style bulk-read then exfil/destroy (24h)
   KILL_CHAIN:CROSS_SESSION:READ_THEN_DELETE hard DENY — read+delete same resource across sessions
   KILL_CHAIN:CROSS_SESSION:SENSITIVITY_RAMP ESCALATE — 4-hour progressive sensitivity ramp
@@ -46,6 +48,14 @@ _DESTRUCTIVE_ACTIONS = {
     "delete", "remove", "drop", "truncate",
     "wipe", "purge", "destroy", "overwrite",
 }
+
+# Union used by Detector 5 — actions that represent the first escalation step.
+# Precomputed at import time so the hot path avoids repeated set construction.
+_ALL_ESCALATION_ACTIONS: frozenset[str] = frozenset(_DESTRUCTIVE_ACTIONS) | _EXFIL_ACTIONS
+
+# Minimum prior requests before ACTION_TYPE_ESCALATION fires — avoids flagging
+# brand-new agents that have no established behavioral baseline to compare against.
+ACTION_ESCALATION_MIN_HISTORY = 5
 
 
 def _normalize_path(resource: str) -> str:
@@ -156,5 +166,30 @@ def analyze_kill_chain(agent_id: str, action: str, resource: str) -> list[str]:
     prefixes.add(_top_prefix(resource))
     if len(prefixes) >= SWEEP_PREFIX_THRESHOLD:
         flags.append(f"KILL_CHAIN:DIRECTORY_SWEEP:{len(prefixes)}_prefixes")
+
+    # ── Detector 5: Action type escalation (first destructive/exfil use) ──────
+    # 24h window: agent has accumulated ≥ ACTION_ESCALATION_MIN_HISTORY requests
+    # that were entirely non-destructive and non-exfil, and now attempts a
+    # destructive or exfiltration action for the first time.
+    #
+    # This catches the "slow-burn compromise" pattern: an agent that has been
+    # operating cleanly (reads, searches, queries) for hours or days is suddenly
+    # hijacked via prompt injection or tool poisoning and attempts a destructive
+    # step.  BULK_READ_THEN_* misses this when read counts are low; this detector
+    # fires independently of read volume.
+    #
+    # Intentionally ESCALATE (not hard DENY) because a legitimate multi-phase
+    # workflow might also issue its first destructive step after a read phase.
+    # Human review resolves the ambiguity without blocking production workloads.
+    if action_lower in _ALL_ESCALATION_ACTIONS and len(history) >= ACTION_ESCALATION_MIN_HISTORY:
+        prior_escalations = [
+            h for h in history if h["action"].lower() in _ALL_ESCALATION_ACTIONS
+        ]
+        if not prior_escalations:
+            category = "EXFIL" if action_lower in _EXFIL_ACTIONS else "DESTROY"
+            flags.append(
+                f"KILL_CHAIN:ACTION_TYPE_ESCALATION:{category}:"
+                f"first_use_after_{len(history)}_benign_requests"
+            )
 
     return flags
