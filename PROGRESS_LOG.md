@@ -4,6 +4,74 @@ Neutral engineering changelog — what changed, test results, branch/PR links.
 
 ---
 
+## 2026-06-16 — Explicit fail-closed behavior for the authorization pipeline
+
+**Branch:** `daily/2026-06-16-fail-closed-behavior`
+
+### What changed
+
+**New file: `core/fail_mode.py`**
+
+Stdlib-only module that governs what happens when the trust-scoring pipeline
+raises an unexpected exception inside `/authorize`:
+
+- `is_fail_closed() -> bool` — reads `AGENTGATE_FAIL_MODE` env var at call
+  time (not module load) so tests can change it without reimporting.
+  Returns `True` when the var is absent, `"closed"`, or any value other than
+  `"open"`.  Case-insensitive; strips surrounding whitespace.
+- `FAIL_CLOSED_FLAG = "FAIL_CLOSED"` — attack flag written to the audit log
+  on a fail-closed DENY so operators can distinguish it from a policy or
+  trust-score DENY.
+- `FAIL_CLOSED_EXPLANATION` — operator-facing string that names the
+  condition and points to server logs; contains no exception class names,
+  stack-trace snippets, or internal path information.
+
+**Modified: `server/main.py`**
+
+The trust-scoring block in `/authorize` (the `asyncio.to_thread(compute_trust...)`
+call through `generate_explanation`) is now wrapped in `try/except Exception`.
+On any unhandled exception:
+
+- If `is_fail_closed()` → return `DENY` with `FAIL_CLOSED` flag, queue an
+  audit entry, broadcast to the dashboard, and fire an alert.  The exception
+  class name is logged server-side; nothing internal is returned to the caller.
+- If `is_fail_closed()` is `False` (only when `AGENTGATE_FAIL_MODE=open`) →
+  re-raise so FastAPI returns HTTP 500 (development/debug mode).
+
+`/healthz` now returns `"fail_mode": "closed"` or `"fail_mode": "open"` so
+operators can verify the setting without inspecting env vars.
+
+**New file: `tests/test_fail_closed.py`**
+
+20 stdlib-only tests across 3 classes:
+
+- `TestIsFailClosedDefault` (8 tests) — default is closed, explicit "closed"
+  is closed, "open" disables fail-closed, unknown values default to closed,
+  case insensitivity (OPEN/Open/oPeN), whitespace stripping, live env-var
+  updates reflected without reimport.
+- `TestFailClosedConstants` (10 tests) — `FAIL_CLOSED_FLAG` is a non-empty
+  string starting with `FAIL_`; `FAIL_CLOSED_EXPLANATION` is a non-empty
+  string that mentions "internal error", "closed", server logs, and
+  `AGENTGATE_FAIL_MODE`; explanation does not contain `"Traceback"`,
+  `"Error:"`, `"Exception:"`, `"line "`, or `"File "`.
+- `TestFailModeDocstring` (2 tests) — module and function have docstrings.
+
+### Test results
+
+```
+Ran 34 tests in 0.172s — OK
+  (20 new: tests/test_fail_closed.py + 14 existing: tests/test_audit_wal_stdlib.py)
+```
+
+Full integration tests (requiring `pydantic`, `fastapi`, `sentence-transformers`)
+are not runnable in this environment due to network restrictions.
+
+### Market analysis
+
+Market analysis completed; recorded privately.
+
+---
+
 ## 2026-06-13 — SQLite WAL mode + async audit write queue
 
 **Branch:** `daily/2026-06-13-audit-wal-write-queue`
