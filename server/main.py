@@ -199,6 +199,8 @@ async def lifespan(app: FastAPI):
     else:
         print("[AgentGate] SIEM OFF — set AGENTGATE_SPLUNK_HEC_URL or AGENTGATE_SENTINEL_WORKSPACE_ID to enable")
     yield
+    # Drain the async audit write queue before shutdown so in-flight entries are persisted.
+    await asyncio.to_thread(audit.flush_audit_queue)
     cleanup_task.cancel()
 
 
@@ -252,10 +254,12 @@ async def _security_headers(request: Request, call_next):
 
 @app.get("/healthz")
 async def healthz():
+    from core import fail_mode as _fm
     return {
         "status": "ok",
         "alerts": alert_status(),
         "siem": siem_status() or "not configured",
+        "fail_mode": "closed" if _fm.is_fail_closed() else "open",
     }
 
 
@@ -619,7 +623,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
     # Unknown agent → deny immediately
     if body.agent_id not in _agents:
         response = _build_unknown_agent_response(body)
-        await asyncio.to_thread(audit.log_decision, response, False)
+        audit.log_decision_queued(response, False)
         await manager.broadcast({"type": "decision", "data": response.model_dump()})
         return response
 
@@ -678,7 +682,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
             ),
             attack_flags=["QUARANTINED", f"QUARANTINE_TRIGGER:{q_record.trigger}"],
         )
-        await asyncio.to_thread(audit.log_decision, response)
+        audit.log_decision_queued(response)
         await manager.broadcast({"type": "decision", "data": response.model_dump()})
         fire_alert(
             "DENY", body.agent_id, body.action, body.resource,
@@ -690,7 +694,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
     policy_match = check_policies(body.agent_id, body.action, body.resource)
     if policy_match.matched:
         response = _build_policy_blocked_response(body, agent, policy_match)
-        await asyncio.to_thread(audit.log_decision, response)
+        audit.log_decision_queued(response)
         await manager.broadcast({"type": "decision", "data": response.model_dump()})
         fire_alert(
             response.decision.value, body.agent_id,
@@ -750,7 +754,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
                 attack_flags=["INJECTION_DETECTED", f"INJECTION_CONFIDENCE:{round(scan_result.confidence * 100)}%"],
                 injection_score=scan_result.confidence,
             )
-            await asyncio.to_thread(audit.log_decision, response)
+            audit.log_decision_queued(response)
             await manager.broadcast({"type": "decision", "data": response.model_dump()})
             fire_alert(
                 "DENY", body.agent_id, body.action, body.resource,
@@ -774,16 +778,59 @@ async def authorize(request: Request, body: AuthorizationRequest):
     # Trust contagion: apply penalty if a delegation neighbour is quarantined
     contagion_penalty, contagion_flags = _contagion.get_contagion_penalty(body.agent_id)
 
-    # compute_trust calls SQLite (request history, baselines) — run in thread pool
-    breakdown, flags = await asyncio.to_thread(
-        trust_engine.compute_trust, agent, body, _agents, injection_risk,
-        contagion_penalty, contagion_flags,
-    )
-    decision = trust_engine.make_decision(breakdown, flags)
-    explanation = generate_explanation(
-        agent.name, body.action, body.resource,
-        breakdown, decision, flags
-    )
+    # compute_trust calls SQLite (request history, baselines) — run in thread pool.
+    # Any unexpected exception is caught here. The default behavior is fail-closed:
+    # return DENY rather than letting an internal error be interpreted as a permit.
+    # Set AGENTGATE_FAIL_MODE=open to re-raise instead (development only).
+    try:
+        breakdown, flags = await asyncio.to_thread(
+            trust_engine.compute_trust, agent, body, _agents, injection_risk,
+            contagion_penalty, contagion_flags,
+        )
+        decision = trust_engine.make_decision(breakdown, flags)
+        explanation = generate_explanation(
+            agent.name, body.action, body.resource,
+            breakdown, decision, flags
+        )
+    except Exception as _pipeline_exc:
+        from core import fail_mode as _fm
+        if _fm.is_fail_closed():
+            # Log the error type only — no stack details in the response to avoid
+            # leaking internal structure to callers.
+            _exc_type = type(_pipeline_exc).__name__
+            print(
+                f"[AgentGate] FAIL_CLOSED — trust pipeline raised {_exc_type} "
+                f"for {body.agent_id} {body.action} {body.resource}",
+                flush=True,
+            )
+            from core.trust_engine import classify_resource_sensitivity, SENSITIVITY_THRESHOLDS
+            from core.models import TrustBreakdown
+            _sensitivity = classify_resource_sensitivity(body.resource, body.action)
+            _fc_breakdown = TrustBreakdown(
+                identity_score=0, delegation_score=0,
+                purpose_alignment_score=0, behavioral_score=0,
+                resource_sensitivity=_sensitivity,
+                final_score=0,
+                threshold_required=SENSITIVITY_THRESHOLDS[_sensitivity],
+            )
+            _fc_response = AuthorizationResponse(
+                request_id=body.request_id,
+                agent_id=body.agent_id,
+                action=body.action,
+                resource=body.resource,
+                decision=Decision.DENY,
+                trust_breakdown=_fc_breakdown,
+                explanation=_fm.FAIL_CLOSED_EXPLANATION,
+                attack_flags=[_fm.FAIL_CLOSED_FLAG],
+            )
+            audit.log_decision_queued(_fc_response, False)
+            await manager.broadcast({"type": "decision", "data": _fc_response.model_dump()})
+            fire_alert(
+                "DENY", body.agent_id, body.action, body.resource,
+                _fm.FAIL_CLOSED_EXPLANATION, [_fm.FAIL_CLOSED_FLAG], 0,
+            )
+            return _fc_response
+        raise
 
     # ── Human-in-the-loop: pause ESCALATE for manual review ───────────────
     if decision == Decision.ESCALATE and agent.requires_human_approval:
@@ -812,7 +859,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
             attack_flags=flags,
             injection_score=injection_risk if injection_risk > 0 else None,
         )
-        await asyncio.to_thread(audit.log_decision, response)
+        audit.log_decision_queued(response)
         return response
 
     response = AuthorizationResponse(
@@ -870,7 +917,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
                 0,
             )
 
-    await asyncio.to_thread(audit.log_decision, response)
+    audit.log_decision_queued(response)
     await manager.broadcast({"type": "decision", "data": response.model_dump()})
     fire_alert(
         decision.value, body.agent_id,
