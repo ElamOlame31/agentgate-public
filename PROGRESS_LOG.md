@@ -4,6 +4,84 @@ Neutral engineering changelog — what changed, test results, branch/PR links.
 
 ---
 
+## 2026-06-19 — Lethal trifecta detector (exposure + reach + egress)
+
+**Branch / PR:** `daily/2026-06-19-lethal-trifecta-detector` · https://github.com/ElamOlame31/agentgate-public/pull/9
+
+### What changed
+
+**New file: `core/trifecta.py`**
+
+Stdlib-only module (no pydantic dependency) that detects the highest-risk agent
+configuration: an agent that simultaneously holds external content exposure
+(`processes_external_content=True`), authorization to access HIGH or CRITICAL
+sensitivity resources, and egress capability (authorized actions in the
+`send/email/upload/post/forward/export/transfer/publish` set).
+
+Public API: `detect_lethal_trifecta(processes_external_content, authorized_resources,
+authorized_actions, action) -> list[str]`
+
+Returns:
+- `LETHAL_TRIFECTA:EXFIL` — all three conditions active, current action is an
+  exfiltration verb → routes to **hard DENY** in `make_decision()`.
+- `LETHAL_TRIFECTA:RISK` — all three conditions active, action is a non-read
+  non-exfil mutation → routes to **ESCALATE** via the existing flag→ESCALATE path.
+- `[]` — trifecta not active, or action is safe read-only.
+
+The detector evaluates registration-time capability (the agent's declared scope),
+not just the isolated request. An agent that is one injected instruction away from
+exfiltration is flagged at the exfil step regardless of how individually-innocent
+preceding requests looked.
+
+**Modified: `core/trust_engine.py`**
+
+- Import `detect_lethal_trifecta` and `LETHAL_TRIFECTA_EXFIL` from `core.trifecta`.
+- One `detect_lethal_trifecta()` call in `compute_trust()` after kill-chain analysis.
+- One hard-deny branch in `make_decision()` for `LETHAL_TRIFECTA:EXFIL`, placed
+  immediately after the existing kill-chain hard-deny block.
+
+**New file: `tests/test_lethal_trifecta.py`**
+
+78 stdlib-only tests across 7 classes:
+
+- `TestConditionsMissing` (10 tests) — all permutations of 1 or 2 absent conditions
+  produce no flags, including the edge case where only the action would be exfil but
+  the registration conditions are not met.
+- `TestExfilVariant` (13 tests) — all 8 exfil action verbs trigger EXFIL; case
+  normalisation (uppercase, mixed-case); single-item return; no RISK co-flag.
+- `TestRiskVariant` (7 tests) — write/delete/admin/update trigger RISK, not EXFIL;
+  case normalisation; single-item return; no EXFIL co-flag.
+- `TestSafeReadActions` (7 tests) — all 12 read-only actions produce no flags even
+  in the full trifecta configuration.
+- `TestHasSensitiveReach` (17 tests) — keyword coverage (salary, hr, finance, vault,
+  pii, medical, nda, merger, gdpr, admin, confidential, credential); case
+  insensitivity; substring matching; empty list; mixed list.
+- `TestHasEgress` (12 tests) — all 8 exfil verbs; case insensitivity; empty list;
+  read-only actions excluded.
+- `TestConstants` (12 tests) — flag prefixes, disjoint-sets invariant, lowercase
+  invariants on all three constant sets.
+
+### Test results
+
+```
+Ran 78 tests in 0.002s — OK
+  (78 new: tests/test_lethal_trifecta.py, stdlib only)
+
+Ran 14 tests in 0.155s — OK
+  (14 existing: tests/test_audit_wal_stdlib.py — regression check)
+
+Total: 92 tests, 0 failures
+```
+
+Full integration tests (requiring `pydantic`, `fastapi`, `sentence-transformers`)
+are not runnable in this environment due to network restrictions.
+
+### Market analysis
+
+Market analysis completed; recorded privately.
+
+---
+
 ## 2026-06-17 — Purpose drift detection across 24-hour audit history
 
 **Branch / PR:** `daily/2026-06-17-purpose-drift-detection` · https://github.com/ElamOlame31/agentgate-public/pull/7
