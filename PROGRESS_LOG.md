@@ -4,6 +4,95 @@ Neutral engineering changelog — what changed, test results, branch/PR links.
 
 ---
 
+## 2026-06-21 — MCP tool argument injection scanner
+
+**Branch / PR:** `daily/2026-06-21-mcp-arg-injection-scanner` · https://github.com/ElamOlame31/agentgate-public/pull/11
+
+### What changed
+
+**New file: `core/mcp_arg_scanner.py`**
+
+Stdlib-only module (no external deps) that scans `tools/call` `params.arguments`
+for attack patterns before the request is forwarded to the upstream MCP server.
+Complements the existing `output_sanitizer.py` (response side) to make the proxy
+bidirectional — both directions are now scanned for threats.
+
+Five detection categories:
+
+- **SHELL_INJECTION** (critical → block) — command substitution (`$(…)`, `` `…` ``),
+  command chaining (`;`/`&&`/`||`/`|` + known command word), variable expansion
+  (`${…}`), background execution, newline injection with trailing command.  Uses a
+  `frozenset` of 55 known shell command words to suppress false positives from
+  natural-language text containing `;` or `|`.
+- **CODE_INJECTION** (high → block) — `eval(`, `exec(`, `os.system(`, `os.popen(`,
+  `subprocess.run/Popen/call/check_output(`, `__import__(`, `getattr(…, "exec")`.
+  Requires the call-site form `word(` so bare words like "eval" in prose don't fire.
+- **SSRF** (high → block) — AWS/GCP/ECS/Alibaba cloud metadata IPs, `localhost` /
+  `127.x` / `::1` in URL form, RFC 1918 ranges in URL form.
+- **PATH_TRAVERSAL** (high → block) — `../`, `..\`, URL-encoded `%2e%2e`, absolute
+  paths to `/etc/passwd`, `/etc/shadow`, `C:\Windows\System32`, etc.
+- **NULL_BYTE** (medium → warn + forward) — NUL-byte padding / suffix-bypass.
+
+`scan_arguments(arguments, tool_name)` recursively extracts all string leaf values
+from the arguments object (dict / list / nested) up to `MAX_DEPTH=6`, truncating
+each value to `MAX_VALUE_LENGTH=4096` chars before regex matching (ReDoS guard).
+Returns `ArgScanResult` with `findings`, `highest_severity`, and `blocked` flag.
+
+**Modified: `server/mcp_proxy.py`**
+
+- Added argument-scan block inside `if decision == "PERMIT":` for `tools/call`
+  requests, between the `/authorize` response and the `_forward(body, {})` call.
+- `blocked=True` on CRITICAL or HIGH findings: returns JSON-RPC error `-32010`
+  (`TOOL_ARG_INJECTION:<category>:<subcategory> in argument '<path>'`), fires
+  async `_report_to_agentgate()` for audit/dashboard, logs to stdout.
+- `blocked=False` / medium findings: forwarded with stdout warning.
+- `ImportError` on missing module: silently skipped (proxy degrades gracefully).
+- `healthz` endpoint: new `"arg_injection_scan": "enabled"` field.
+- Proxy version bumped `1.1.0 → 1.2.0`.
+
+**New file: `tests/test_mcp_arg_scanner.py`**
+
+72 stdlib-only tests across 9 classes:
+
+- `TestCleanArguments` (11 tests) — false-positive guard: natural language, `os.path`,
+  normal newlines, external API URLs, numeric/boolean/none values, empty/null args.
+- `TestShellInjection` (12 tests) — all six shell sub-patterns, nested dict, list,
+  arg-path annotation, non-empty excerpt.
+- `TestCodeInjection` (8 tests) — eval, exec, os.system, os.popen, subprocess.run,
+  `__import__`, false-positive guard on prose mention of "eval".
+- `TestSSRF` (8 tests) — AWS IMDS, GCP metadata, localhost, 127.x, RFC 1918,
+  raw metadata IP (no URL scheme), external API as non-SSRF.
+- `TestPathTraversal` (7 tests) — `../`, `..\`, `/etc/passwd`, `/etc/shadow`,
+  URL-encoded traversal, `./` as non-traversal.
+- `TestNullByte` (4 tests) — detection, non-blocking on medium-only.
+- `TestSeverityOrdering` (7 tests) — critical wins over high, blocked on high,
+  not-blocked on medium, multi-finding sort order, zero findings on clean input.
+- `TestRecursiveStructures` (6 tests) — deeply nested dict, list index in path,
+  mixed types, integer skip.
+- `TestResultStructure` / `TestConstants` (9 tests) — API shape, field types,
+  `MAX_VALUE_LENGTH ≥ 1024`, `MAX_DEPTH ≥ 3`, large-value truncation safety.
+
+### Test results
+
+```
+Ran 72 tests in 0.007s — OK
+  (72 new: tests/test_mcp_arg_scanner.py, stdlib only)
+
+Ran 14 tests in 0.146s — OK
+  (14 existing: tests/test_audit_wal_stdlib.py — regression check)
+
+Total: 86 tests, 0 failures
+```
+
+Full integration tests (requiring `pydantic`, `fastapi`, `sentence-transformers`)
+are not runnable in this environment due to network restrictions.
+
+### Market analysis
+
+Market analysis completed; recorded privately.
+
+---
+
 ## 2026-06-20 — Pipeline latency tracking and `/metrics` endpoint
 
 **Branch / PR:** `daily/2026-06-20-latency-metrics` · https://github.com/ElamOlame31/agentgate-public/pull/10
