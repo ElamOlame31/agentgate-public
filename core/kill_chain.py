@@ -21,6 +21,7 @@ import posixpath
 from urllib.parse import unquote
 from core import audit
 from core.models import ResourceSensitivity, EXFILTRATION_ACTIONS as _EXFIL_ACTIONS
+from core.lateral_movement import detect_lateral_movement
 
 # Maximum query window — one DB round-trip per authorize call; filter in-process per detector.
 # Cross-session history survives server restarts because request_history is SQLite-backed.
@@ -156,5 +157,8 @@ def analyze_kill_chain(agent_id: str, action: str, resource: str) -> list[str]:
     prefixes.add(_top_prefix(resource))
     if len(prefixes) >= SWEEP_PREFIX_THRESHOLD:
         flags.append(f"KILL_CHAIN:DIRECTORY_SWEEP:{len(prefixes)}_prefixes")
+
+    # ── Detectors 5 & 6: Lateral movement (credential harvest + namespace sweep)
+    flags.extend(detect_lateral_movement(action, resource, history))
 
     return flags

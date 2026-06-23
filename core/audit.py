@@ -1,9 +1,11 @@
 import hashlib
 import hmac as _hmac_mod
 import os
+import queue as _queue
 import re
 import sqlite3
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -25,8 +27,27 @@ def hash_token(token: str) -> str:
 DB_PATH = Path(__file__).parent.parent / "agentgate_audit.db"
 
 
+def _open_db(path: Path | None = None) -> sqlite3.Connection:
+    """Open a connection with per-connection performance pragmas.
+
+    journal_mode=WAL persists in the DB file (set once in init_db).
+    synchronous=NORMAL does not persist — set it on every write connection
+    to skip unnecessary fsync calls while remaining safe under WAL.
+    """
+    conn = sqlite3.connect(path or DB_PATH)
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
+    # WAL mode: readers never block writers and writers never block readers.
+    # NORMAL sync is safe with WAL — survives OS crash; a power loss at the exact
+    # wrong moment could lose the last committed transaction (acceptable for an
+    # authorization log; better than the throughput cost of FULL sync).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint=200")  # checkpoint every ~800 KB
     conn.execute("""
         CREATE TABLE IF NOT EXISTS audit_log (
             id TEXT PRIMARY KEY,
@@ -185,11 +206,12 @@ def _compute_entry_hash(prev_hash: str, entry_json: str) -> str:
 
 
 def log_decision(response: AuthorizationResponse, record_history: bool = True):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _open_db()
     try:
-        # EXCLUSIVE lock serializes the read→hash→write so concurrent requests
+        # IMMEDIATE lock serializes the read→hash→write so concurrent requests
         # cannot both read the same prev_hash and produce a branched chain.
-        conn.execute("BEGIN EXCLUSIVE")
+        # In WAL mode IMMEDIATE still allows concurrent readers (unlike EXCLUSIVE).
+        conn.execute("BEGIN IMMEDIATE")
         entry_json = response.model_dump_json()
         prev_hash  = _get_last_entry_hash(conn)
         entry_hash = _compute_entry_hash(prev_hash, entry_json)
@@ -750,6 +772,89 @@ def cleanup_expired_quarantines() -> None:
     conn.execute("DELETE FROM agent_quarantine WHERE expires_at <= ?", (time.time(),))
     conn.commit()
     conn.close()
+
+
+# ── Async write queue ─────────────────────────────────────────────────────────
+#
+# Decouples authorization latency from audit-write latency. The hot /authorize
+# path enqueues an entry and returns immediately; a single background thread
+# drains the queue in FIFO order, which preserves the HMAC chain sequence
+# without needing the BEGIN EXCLUSIVE lock that serialised all decisions before.
+#
+# Crash semantics: entries in the queue at process death are lost (at-most-once).
+# The authorization DECISION has already been returned to the caller at that
+# point, so the security guarantee is unaffected — only the audit record is at
+# risk. The queue is bounded at 10 000 entries; if it fills the write falls back
+# to the synchronous path (same behaviour as before this change).
+
+_AUDIT_QUEUE_MAXSIZE = int(os.getenv("AGENTGATE_AUDIT_QUEUE_SIZE", "10000"))
+_audit_queue: _queue.Queue = _queue.Queue(maxsize=_AUDIT_QUEUE_MAXSIZE)
+_writer_lock = threading.Lock()
+_writer_thread: threading.Thread | None = None
+
+
+def _ensure_writer_started() -> None:
+    global _writer_thread
+    if _writer_thread is not None and _writer_thread.is_alive():
+        return
+    with _writer_lock:
+        if _writer_thread is not None and _writer_thread.is_alive():
+            return
+        t = threading.Thread(
+            target=_audit_writer_loop,
+            daemon=True,
+            name="agentgate-audit-writer",
+        )
+        t.start()
+        _writer_thread = t
+
+
+def _audit_writer_loop() -> None:
+    while True:
+        item = _audit_queue.get()
+        if item is None:
+            _audit_queue.task_done()
+            break
+        response, record_history = item
+        try:
+            log_decision(response, record_history)
+        except Exception as exc:
+            print(f"[AgentGate] audit write error: {exc}", flush=True)
+        finally:
+            _audit_queue.task_done()
+
+
+def log_decision_queued(response: AuthorizationResponse, record_history: bool = True) -> None:
+    """Non-blocking audit log write. Returns immediately after enqueueing.
+
+    The background writer thread processes entries in FIFO order, preserving
+    the HMAC chain sequence that log_decision() requires. Falls back to a
+    synchronous write when the queue is full so no entries are ever silently
+    dropped.
+    """
+    _ensure_writer_started()
+    try:
+        _audit_queue.put_nowait((response, record_history))
+    except _queue.Full:
+        # Backlog > AGENTGATE_AUDIT_QUEUE_SIZE — fall back to synchronous write.
+        # The IMMEDIATE lock in log_decision() ensures chain integrity even when
+        # mixing queued and direct writes.
+        print(
+            f"[AgentGate] audit queue full ({_AUDIT_QUEUE_MAXSIZE} entries) — "
+            "writing synchronously",
+            flush=True,
+        )
+        log_decision(response, record_history)
+
+
+def flush_audit_queue() -> None:
+    """Block until all queued entries are persisted to SQLite.
+
+    Call this before process shutdown or in tests that read DB state after
+    log_decision_queued() to avoid a race between the writer thread and the
+    assertion.
+    """
+    _audit_queue.join()
 
 
 def get_stats() -> dict:
