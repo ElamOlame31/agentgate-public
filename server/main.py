@@ -199,6 +199,8 @@ async def lifespan(app: FastAPI):
     else:
         print("[AgentGate] SIEM OFF — set AGENTGATE_SPLUNK_HEC_URL or AGENTGATE_SENTINEL_WORKSPACE_ID to enable")
     yield
+    # Drain the async audit write queue before shutdown so in-flight entries are persisted.
+    await asyncio.to_thread(audit.flush_audit_queue)
     cleanup_task.cancel()
 
 
@@ -619,7 +621,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
     # Unknown agent → deny immediately
     if body.agent_id not in _agents:
         response = _build_unknown_agent_response(body)
-        await asyncio.to_thread(audit.log_decision, response, False)
+        audit.log_decision_queued(response, False)
         await manager.broadcast({"type": "decision", "data": response.model_dump()})
         return response
 
@@ -678,7 +680,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
             ),
             attack_flags=["QUARANTINED", f"QUARANTINE_TRIGGER:{q_record.trigger}"],
         )
-        await asyncio.to_thread(audit.log_decision, response)
+        audit.log_decision_queued(response)
         await manager.broadcast({"type": "decision", "data": response.model_dump()})
         fire_alert(
             "DENY", body.agent_id, body.action, body.resource,
@@ -690,7 +692,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
     policy_match = check_policies(body.agent_id, body.action, body.resource)
     if policy_match.matched:
         response = _build_policy_blocked_response(body, agent, policy_match)
-        await asyncio.to_thread(audit.log_decision, response)
+        audit.log_decision_queued(response)
         await manager.broadcast({"type": "decision", "data": response.model_dump()})
         fire_alert(
             response.decision.value, body.agent_id,
@@ -750,7 +752,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
                 attack_flags=["INJECTION_DETECTED", f"INJECTION_CONFIDENCE:{round(scan_result.confidence * 100)}%"],
                 injection_score=scan_result.confidence,
             )
-            await asyncio.to_thread(audit.log_decision, response)
+            audit.log_decision_queued(response)
             await manager.broadcast({"type": "decision", "data": response.model_dump()})
             fire_alert(
                 "DENY", body.agent_id, body.action, body.resource,
@@ -812,7 +814,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
             attack_flags=flags,
             injection_score=injection_risk if injection_risk > 0 else None,
         )
-        await asyncio.to_thread(audit.log_decision, response)
+        audit.log_decision_queued(response)
         return response
 
     response = AuthorizationResponse(
@@ -870,7 +872,7 @@ async def authorize(request: Request, body: AuthorizationRequest):
                 0,
             )
 
-    await asyncio.to_thread(audit.log_decision, response)
+    audit.log_decision_queued(response)
     await manager.broadcast({"type": "decision", "data": response.model_dump()})
     fire_alert(
         decision.value, body.agent_id,

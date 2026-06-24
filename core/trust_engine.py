@@ -12,6 +12,7 @@ from core.models import (
 from core.purpose_engine import compute_purpose_score
 from core import audit
 from core.kill_chain import analyze_kill_chain
+from core.trifecta import detect_lethal_trifecta, LETHAL_TRIFECTA_EXFIL
 
 # Sensitivity thresholds: minimum trust score required to PERMIT
 SENSITIVITY_THRESHOLDS = {
@@ -341,6 +342,14 @@ def compute_trust(
     kc_flags = analyze_kill_chain(agent.agent_id, request.action, request.resource)
     all_flags.extend(kc_flags)
 
+    trifecta_flags = detect_lethal_trifecta(
+        processes_external_content=agent.processes_external_content,
+        authorized_resources=list(agent.authorized_resources),
+        authorized_actions=list(agent.authorized_actions),
+        action=request.action,
+    )
+    all_flags.extend(trifecta_flags)
+
     beh_score, beh_flags = score_behavioral(agent.agent_id, request.action)
     # Penalize behavioral score when a prior injection scan flagged this agent
     if injection_risk > 0.5:
@@ -386,6 +395,11 @@ def make_decision(breakdown: TrustBreakdown, flags: list[str]) -> Decision:
     if any("BULK_READ_THEN_" in f for f in flags):
         return Decision.DENY
     if any("READ_THEN_DELETE" in f for f in flags):
+        return Decision.DENY
+
+    # Hard deny on lethal trifecta exfiltration — agent has external content exposure,
+    # sensitive data reach, AND egress capability, and is now attempting to exfiltrate.
+    if LETHAL_TRIFECTA_EXFIL in flags:
         return Decision.DENY
 
     # Hard deny on behavioral contract violations — agent exceeded its own declared limits
