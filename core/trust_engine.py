@@ -12,6 +12,7 @@ from core.models import (
 from core.purpose_engine import compute_purpose_score
 from core import audit
 from core.kill_chain import analyze_kill_chain
+from core.time_anomaly import detect_time_anomaly as _detect_time_anomaly, BASELINE_WINDOW_SECONDS as _TIME_BASELINE_WINDOW
 
 # Sensitivity thresholds: minimum trust score required to PERMIT
 SENSITIVITY_THRESHOLDS = {
@@ -340,6 +341,14 @@ def compute_trust(
 
     kc_flags = analyze_kill_chain(agent.agent_id, request.action, request.resource)
     all_flags.extend(kc_flags)
+
+    # Time-of-day behavioral anomaly: inferred from 7-day history, no registration-time
+    # configuration required. Emits ESCALATE-tier flag when the request hour falls
+    # significantly outside the agent's established operating pattern.
+    _time_history = audit.get_agent_request_history(
+        agent.agent_id, window_seconds=_TIME_BASELINE_WINDOW
+    )
+    all_flags.extend(_detect_time_anomaly(_time_history))
 
     beh_score, beh_flags = score_behavioral(agent.agent_id, request.action)
     # Penalize behavioral score when a prior injection scan flagged this agent
